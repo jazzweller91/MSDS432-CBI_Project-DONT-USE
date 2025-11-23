@@ -206,20 +206,6 @@ func init() {
 
 	// Establish connection to Postgres Database
 
-	// OPTION 1 - Postgress application running on localhost
-	//db_connection := "user=postgres dbname=chicago_business_intelligence password=root host=localhost sslmode=disable port = 5432"
-
-	// OPTION 2
-	// Docker container for the Postgres microservice - uncomment when deploy with host.docker.internal
-	//db_connection := "user=postgres dbname=chicago_business_intelligence password=root host=host.docker.internal sslmode=disable port = 5433"
-
-	// OPTION 3
-	// Docker container for the Postgress microservice - uncomment when deploy with IP address of the container
-	// To find your Postgres container IP, use the command with your network name listed in the docker compose file as follows:
-	// docker network inspect cbi_backend
-	//db_connection := "user=postgres dbname=chicago_business_intelligence password=root host=162.123.0.9 sslmode=disable port = 5433"
-
-	//Option 4
 	//Database application running on Google Cloud Platform.
 	db_connection := "user=postgres dbname=chicago_business_intelligence password=root host=/cloudsql/tranquil-bazaar-478622-s3:us-central1:mypostgres sslmode=disable port = 5432"
 
@@ -276,8 +262,8 @@ func main() {
 		go GetBuildingPermits(db)
 		go GetTaxiTrips(db)
 
-		// go GetCovidDetails(db)
-		// go GetCCVIDetails(db)
+		go GetCovidDetails(db)
+		go GetCCVIDetails(db)
 
 		http.HandleFunc("/", handler)
 
@@ -366,7 +352,7 @@ func GetTaxiTrips(db *sql.DB) {
 
 	// Get the the Taxi Trips for Taxi medallions list
 
-	var url = "https://data.cityofchicago.org/resource/wrvz-psew.json?$limit=500"
+	var url = "https://data.cityofchicago.org/resource/wrvz-psew.json?$order=trip_start_timestamp DESC&$limit=10000"
 
 	tr := &http.Transport{
 		MaxIdleConns:          10,
@@ -388,6 +374,8 @@ func GetTaxiTrips(db *sql.DB) {
 	if err != nil {
 		panic(err)
 	}
+	// ADDED: close the first response body
+	defer res.Body.Close()
 
 	fmt.Println("Received data from SODA REST API for Taxi Trips")
 
@@ -397,12 +385,14 @@ func GetTaxiTrips(db *sql.DB) {
 
 	// Get the Taxi Trip list for rideshare companies like Uber/Lyft list
 	// Transportation-Network-Providers-Trips:
-	var url_2 = "https://data.cityofchicago.org/resource/m6dm-c72p.json?$limit=500"
+	var url_2 = "https://data.cityofchicago.org/resource/m6dm-c72p.json?$order=trip_start_timestamp DESC&$limit=10000"
 
 	res_2, err := http.Get(url_2)
 	if err != nil {
 		panic(err)
 	}
+	// ADDED: close the second response body
+	defer res_2.Body.Close()
 
 	fmt.Println("Received data from SODA REST API for Transportation-Network-Providers-Trips")
 
@@ -416,6 +406,9 @@ func GetTaxiTrips(db *sql.DB) {
 	// Add the Taxi medallions list & rideshare companies like Uber/Lyft list
 
 	taxi_trips_list := append(taxi_trips_list_1, taxi_trips_list_2...)
+
+	// ADDED: optional counter for inserted rows
+	insertCount := 0
 
 	// Process the list
 
@@ -484,6 +477,10 @@ func GetTaxiTrips(db *sql.DB) {
 		fmt.Println(pickup_location)
 
 		pickup_address_list, _ := geocoder.GeocodingReverse(pickup_location)
+		// ADDED: guard against empty results
+		if len(pickup_address_list) == 0 {
+			continue
+		}
 		pickup_address := pickup_address_list[0]
 		pickup_zip_code := pickup_address.PostalCode
 
@@ -499,6 +496,10 @@ func GetTaxiTrips(db *sql.DB) {
 		}
 
 		dropoff_address_list, _ := geocoder.GeocodingReverse(dropoff_location)
+		// ADDED: guard here too
+		if len(dropoff_address_list) == 0 {
+			continue
+		}
 		dropoff_address := dropoff_address_list[0]
 		dropoff_zip_code := dropoff_address.PostalCode
 
@@ -521,10 +522,10 @@ func GetTaxiTrips(db *sql.DB) {
 			panic(err)
 		}
 
+		insertCount++
 	}
 
-	fmt.Println("Completed Inserting Rows into the TaxiTrips Table")
-
+	fmt.Printf("Completed Inserting %d Rows into the TaxiTrips Table\n", insertCount)
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -596,19 +597,29 @@ func GetCommunityAreaUnemployment(db *sql.DB) {
 	client := &http.Client{Transport: tr}
 
 	res, err := client.Get(url)
-
 	if err != nil {
 		panic(err)
 	}
+	// ADDED: close body when done
+	defer res.Body.Close()
 
 	fmt.Println("Community Areas Unemplyment: Received data from SODA REST API for Unemployment")
 
-	body, _ := ioutil.ReadAll(res.Body)
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		panic(err)
+	}
 	var unemployment_data_list UnemploymentJsonRecords
-	json.Unmarshal(body, &unemployment_data_list)
+	// ADDED: check unmarshal error
+	if err := json.Unmarshal(body, &unemployment_data_list); err != nil {
+		panic(err)
+	}
 
 	s := fmt.Sprintf("\n\n Community Areas number of SODA records received = %d\n\n", len(unemployment_data_list))
 	io.WriteString(os.Stdout, s)
+
+	// ADDED: counter for successfully inserted rows
+	insertCount := 0
 
 	for i := 0; i < len(unemployment_data_list); i++ {
 
@@ -680,6 +691,10 @@ func GetCommunityAreaUnemployment(db *sql.DB) {
 		per_capita_income := unemployment_data_list[i].Per_capita_income
 
 		unemployment := unemployment_data_list[i].Unemployment
+		// OPTIONAL: if you want to require unemployment to be present:
+		// if unemployment == "" {
+		//     continue
+		// }
 
 		sql := `INSERT INTO community_area_unemployment ("community_area" , 
 		"community_area_name" , 
@@ -748,10 +763,10 @@ func GetCommunityAreaUnemployment(db *sql.DB) {
 			panic(err)
 		}
 
+		insertCount++
 	}
 
-	fmt.Println("Completed Inserting Rows into the community_area_unemployment Table")
-
+	fmt.Printf("Completed Inserting %d Rows into the community_area_unemployment Table\n", insertCount)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -826,7 +841,9 @@ func GetBuildingPermits(db *sql.DB) {
 
 	// While doing unit-testing keep the limit value to 500
 	// later you could change it to 1000, 2000, 10,000, etc.
-	var url = "https://data.cityofchicago.org/resource/building-permits.json?$limit=500"
+
+	// FIXED: use dataset ID ydr8-5enu
+	var url = "https://data.cityofchicago.org/resource/ydr8-5enu.json?$order=issue_date DESC&$limit=10000"
 
 	tr := &http.Transport{
 		MaxIdleConns:       10,
@@ -840,15 +857,23 @@ func GetBuildingPermits(db *sql.DB) {
 	if err != nil {
 		panic(err)
 	}
+	defer res.Body.Close()
 
 	fmt.Println("Received data from SODA REST API for Building Permits")
 
-	body, _ := ioutil.ReadAll(res.Body)
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		panic(err)
+	}
 	var building_data_list BuildingPermitsJsonRecords
-	json.Unmarshal(body, &building_data_list)
+	if err := json.Unmarshal(body, &building_data_list); err != nil {
+		panic(err)
+	}
 
 	s := fmt.Sprintf("\n\n Building Permits: number of SODA records received = %d\n\n", len(building_data_list))
 	io.WriteString(os.Stdout, s)
+
+	insertCount := 0
 
 	for i := 0; i < len(building_data_list); i++ {
 
@@ -857,16 +882,13 @@ func GetBuildingPermits(db *sql.DB) {
 		// We will use the simplest method: drop records that have messy/dirty/missing data
 		// Any record that has messy/dirty/missing data we don't enter it in the data lake/table
 
+		// ---- Keep only *essential* fields required ----
 		permit_id := building_data_list[i].Id
 		if permit_id == "" {
 			continue
 		}
 
-		permit_code := building_data_list[i].Permit_Code
-		if permit_code == "" {
-			continue
-		}
-
+		permit_code := building_data_list[i].Permit_Code // may be blank in some records; keep anyway
 		permit_type := building_data_list[i].Permit_type
 		if permit_type == "" {
 			continue
@@ -881,148 +903,60 @@ func GetBuildingPermits(db *sql.DB) {
 		if application_start_date == "" {
 			continue
 		}
+
 		issue_date := building_data_list[i].Issue_date
 		if issue_date == "" {
 			continue
 		}
-		processing_time := building_data_list[i].Processing_time
-		if processing_time == "" {
-			continue
-		}
 
-		street_number := building_data_list[i].Street_number
-		if street_number == "" {
-			continue
-		}
-		street_direction := building_data_list[i].Street_direction
-		if street_direction == "" {
-			continue
-		}
+		processing_time := building_data_list[i].Processing_time // can be blank; don’t require
+
+		street_number := building_data_list[i].Street_number       // optional
+		street_direction := building_data_list[i].Street_direction // optional
+
 		street_name := building_data_list[i].Street_name
 		if street_name == "" {
 			continue
 		}
-		suffix := building_data_list[i].Suffix
-		if suffix == "" {
-			continue
-		}
-		work_description := building_data_list[i].Work_description
-		if work_description == "" {
-			continue
-		}
-		building_fee_paid := building_data_list[i].Building_fee_paid
-		if building_fee_paid == "" {
-			continue
-		}
-		zoning_fee_paid := building_data_list[i].Zoning_fee_paid
-		if zoning_fee_paid == "" {
-			continue
-		}
-		other_fee_paid := building_data_list[i].Other_fee_paid
-		if other_fee_paid == "" {
-			continue
-		}
-		subtotal_paid := building_data_list[i].Subtotal_paid
-		if subtotal_paid == "" {
-			continue
-		}
-		building_fee_unpaid := building_data_list[i].Building_fee_unpaid
-		if building_fee_unpaid == "" {
-			continue
-		}
-		zoning_fee_unpaid := building_data_list[i].Zoning_fee_unpaid
-		if zoning_fee_unpaid == "" {
-			continue
-		}
-		other_fee_unpaid := building_data_list[i].Other_fee_unpaid
-		if other_fee_unpaid == "" {
-			continue
-		}
-		subtotal_unpaid := building_data_list[i].Subtotal_unpaid
-		if subtotal_unpaid == "" {
-			continue
-		}
-		building_fee_waived := building_data_list[i].Building_fee_waived
-		if building_fee_waived == "" {
-			continue
-		}
-		zoning_fee_waived := building_data_list[i].Zoning_fee_waived
-		if zoning_fee_waived == "" {
-			continue
-		}
-		other_fee_waived := building_data_list[i].Other_fee_waived
-		if other_fee_waived == "" {
-			continue
-		}
 
+		suffix := building_data_list[i].Suffix                     // optional
+		work_description := building_data_list[i].Work_description // optional
+
+		// ---- Fees and financial fields: MANY are often blank; DO NOT require them ----
+		building_fee_paid := building_data_list[i].Building_fee_paid
+		zoning_fee_paid := building_data_list[i].Zoning_fee_paid
+		other_fee_paid := building_data_list[i].Other_fee_paid
+		subtotal_paid := building_data_list[i].Subtotal_paid
+		building_fee_unpaid := building_data_list[i].Building_fee_unpaid
+		zoning_fee_unpaid := building_data_list[i].Zoning_fee_unpaid
+		other_fee_unpaid := building_data_list[i].Other_fee_unpaid
+		subtotal_unpaid := building_data_list[i].Subtotal_unpaid
+		building_fee_waived := building_data_list[i].Building_fee_waived
+		zoning_fee_waived := building_data_list[i].Zoning_fee_waived
+		other_fee_waived := building_data_list[i].Other_fee_waived
 		subtotal_waived := building_data_list[i].Subtotal_waived
-		if subtotal_waived == "" {
-			continue
-		}
 		total_fee := building_data_list[i].Total_fee
-		if total_fee == "" {
-			continue
-		}
 
 		contact_1_type := building_data_list[i].Contact_1_type
-		if contact_1_type == "" {
-			continue
-		}
-
 		contact_1_name := building_data_list[i].Contact_1_name
-		if contact_1_name == "" {
-			continue
-		}
-
 		contact_1_city := building_data_list[i].Contact_1_city
-		if contact_1_city == "" {
-			continue
-		}
 		contact_1_state := building_data_list[i].Contact_1_state
-		if contact_1_state == "" {
-			continue
-		}
-
 		contact_1_zipcode := building_data_list[i].Contact_1_zipcode
-		if contact_1_zipcode == "" {
-			continue
-		}
 
 		reported_cost := building_data_list[i].Reported_cost
-		if reported_cost == "" {
-			continue
-		}
-
 		pin1 := building_data_list[i].Pin1
-		if pin1 == "" {
-			continue
-		}
-
 		pin2 := building_data_list[i].Pin2
-
 		community_area := building_data_list[i].Community_area
-
 		census_tract := building_data_list[i].Census_tract
-		if census_tract == "" {
-			continue
-		}
-
 		ward := building_data_list[i].Ward
-		if ward == "" {
-			continue
-		}
-
 		xcoordinate := building_data_list[i].Xcoordinate
-
 		ycoordinate := building_data_list[i].Ycoordinate
 
 		latitude := building_data_list[i].Latitude
-		if latitude == "" {
-			continue
-		}
-
 		longitude := building_data_list[i].Longitude
-		if longitude == "" {
+
+		// Only truly critical for mapping: require lat/long
+		if latitude == "" || longitude == "" {
 			continue
 		}
 
@@ -1112,9 +1046,10 @@ func GetBuildingPermits(db *sql.DB) {
 			panic(err)
 		}
 
+		insertCount++
 	}
 
-	fmt.Println("Completed Inserting Rows into the Building Permits Table")
+	fmt.Printf("Completed Inserting %d Rows into the Building Permits Table\n", insertCount)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -1154,8 +1089,122 @@ func GetBuildingPermits(db *sql.DB) {
 
 func GetCovidDetails(db *sql.DB) {
 
-	fmt.Println("ADD-YOUR-CODE-HERE - To Implement GetCovidDetails")
+	fmt.Println("GetCovidDetails: Collecting COVID-19 ZIP-Week Data")
 
+	// Drop & recreate table
+	drop_table := `drop table if exists covid_details`
+	_, err := db.Exec(drop_table)
+	if err != nil {
+		panic(err)
+	}
+
+	create_table := `CREATE TABLE IF NOT EXISTS "covid_details" (
+						"id"   SERIAL , 
+						"zip_code"                           VARCHAR(255),
+						"week_number"                        VARCHAR(255),
+						"week_start"                         VARCHAR(255),
+						"week_end"                           VARCHAR(255),
+						"cases_weekly"                       VARCHAR(255),
+						"cases_cumulative"                   VARCHAR(255),
+						"case_rate_weekly"                   VARCHAR(255),
+						"case_rate_cumulative"               VARCHAR(255),
+						"percent_tested_positive_weekly"     VARCHAR(255),
+						"percent_tested_positive_cumulative" VARCHAR(255),
+						"population"                         VARCHAR(255),
+						PRIMARY KEY ("id") 
+					);`
+
+	_, _err := db.Exec(create_table)
+	if _err != nil {
+		panic(_err)
+	}
+
+	fmt.Println("Created Table for covid_details")
+
+	// COVID-19 Cases, Tests, and Deaths by ZIP Code - Historical
+	// Limit kept small for prototyping; increase as needed
+	var url = "https://data.cityofchicago.org/resource/yhhz-zm2v.json?$order=week_start DESC&$limit=10000"
+
+	tr := &http.Transport{
+		MaxIdleConns:       10,
+		IdleConnTimeout:    300 * time.Second,
+		DisableCompression: true,
+	}
+
+	client := &http.Client{Transport: tr}
+
+	res, err := client.Get(url)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Received data from SODA REST API for COVID-19 ZIP-Week cases")
+
+	body, _ := ioutil.ReadAll(res.Body)
+	var covid_data_list CovidJsonRecords
+	json.Unmarshal(body, &covid_data_list)
+
+	s := fmt.Sprintf("\n\n COVID-19: number of SODA records received = %d\n\n", len(covid_data_list))
+	io.WriteString(os.Stdout, s)
+
+	for i := 0; i < len(covid_data_list); i++ {
+
+		// Defensive coding: require at least zip and week_number
+		zip_code := covid_data_list[i].Zip_code
+		if zip_code == "" {
+			continue
+		}
+
+		week_number := covid_data_list[i].Week_number
+		if week_number == "" {
+			continue
+		}
+
+		week_start := covid_data_list[i].Week_start
+		week_end := covid_data_list[i].Week_end
+		cases_weekly := covid_data_list[i].Cases_weekly
+		cases_cumulative := covid_data_list[i].Cases_cumulative
+		case_rate_weekly := covid_data_list[i].Case_rate_weekly
+		case_rate_cumulative := covid_data_list[i].Case_rate_cumulative
+		percent_tested_positive_weekly := covid_data_list[i].Percent_tested_positive_weekly
+		percent_tested_positive_cumulative := covid_data_list[i].Percent_tested_positive_cumulative
+		population := covid_data_list[i].Population
+
+		sqlStmt := `INSERT INTO covid_details (
+			"zip_code",
+			"week_number",
+			"week_start",
+			"week_end",
+			"cases_weekly",
+			"cases_cumulative",
+			"case_rate_weekly",
+			"case_rate_cumulative",
+			"percent_tested_positive_weekly",
+			"percent_tested_positive_cumulative",
+			"population"
+		) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`
+
+		_, err = db.Exec(
+			sqlStmt,
+			zip_code,
+			week_number,
+			week_start,
+			week_end,
+			cases_weekly,
+			cases_cumulative,
+			case_rate_weekly,
+			case_rate_cumulative,
+			percent_tested_positive_weekly,
+			percent_tested_positive_cumulative,
+			population,
+		)
+
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	fmt.Println("Completed Inserting Rows into the covid_details Table")
 }
 
 // //////////////////////////////////////////////////////////////////////////////////
@@ -1191,6 +1240,95 @@ func GetCovidDetails(db *sql.DB) {
 // //////////////////////////////////////////////////////////////////////////////////
 func GetCCVIDetails(db *sql.DB) {
 
-	fmt.Println("ADD-YOUR-CODE-HERE - To Implement GetCCVIDetails")
+	fmt.Println("GetCCVIDetails: Collecting CCVI Data")
 
+	// Drop & recreate table
+	drop_table := `drop table if exists ccvi_details`
+	_, err := db.Exec(drop_table)
+	if err != nil {
+		panic(err)
+	}
+
+	create_table := `CREATE TABLE IF NOT EXISTS "ccvi_details" (
+						"id"   SERIAL , 
+						"geography_type"             VARCHAR(255),
+						"community_area_or_zip_code" VARCHAR(255),
+						"community_name"             VARCHAR(255),
+						"ccvi_score"                 VARCHAR(255),
+						"ccvi_category"              VARCHAR(255),
+						PRIMARY KEY ("id") 
+					);`
+
+	_, _err := db.Exec(create_table)
+	if _err != nil {
+		panic(_err)
+	}
+
+	fmt.Println("Created Table for CCVI")
+
+	// Chicago COVID-19 Community Vulnerability Index (CCVI)
+	var url = "https://data.cityofchicago.org/resource/xhc6-88s9.json?$limit=200"
+
+	tr := &http.Transport{
+		MaxIdleConns:       10,
+		IdleConnTimeout:    300 * time.Second,
+		DisableCompression: true,
+	}
+
+	client := &http.Client{Transport: tr}
+
+	res, err := client.Get(url)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Received data from SODA REST API for CCVI")
+
+	body, _ := ioutil.ReadAll(res.Body)
+	var ccvi_data_list CCVIJsonRecords
+	json.Unmarshal(body, &ccvi_data_list)
+
+	s := fmt.Sprintf("\n\n CCVI: number of SODA records received = %d\n\n", len(ccvi_data_list))
+	io.WriteString(os.Stdout, s)
+
+	for i := 0; i < len(ccvi_data_list); i++ {
+
+		// Defensive coding for key fields
+		geography_type := ccvi_data_list[i].Geography_type
+		if geography_type == "" {
+			continue
+		}
+
+		community_area_or_zip_code := ccvi_data_list[i].Community_area_or_ZIP_code
+		if community_area_or_zip_code == "" {
+			continue
+		}
+
+		community_name := ccvi_data_list[i].Community_name
+		ccvi_score := ccvi_data_list[i].CCVI_score
+		ccvi_category := ccvi_data_list[i].CCVI_category
+
+		sqlStmt := `INSERT INTO ccvi_details (
+			"geography_type",
+			"community_area_or_zip_code",
+			"community_name",
+			"ccvi_score",
+			"ccvi_category"
+		) values($1,$2,$3,$4,$5)`
+
+		_, err = db.Exec(
+			sqlStmt,
+			geography_type,
+			community_area_or_zip_code,
+			community_name,
+			ccvi_score,
+			ccvi_category,
+		)
+
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	fmt.Println("Completed Inserting Rows into the CCVI Table")
 }
